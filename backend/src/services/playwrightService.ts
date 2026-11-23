@@ -217,7 +217,10 @@ export class PlaywrightService {
       const items: any[] = [];
       const formControls = document.querySelectorAll('input, button, select, textarea, form');
 
-      let counter = 1;
+      // Track per-tag counters so nth-of-type(n) is accurate
+      const tagCounters = {} as Record<string, number>;
+      let refCounter = 1;
+
       formControls.forEach((el) => {
         const tag = el.tagName.toLowerCase();
         const htmlEl = el as HTMLElement;
@@ -226,11 +229,16 @@ export class PlaywrightService {
         // Skip hidden elements that have zero dimensions
         if (rect.width === 0 && rect.height === 0) return;
 
+        // Advance per-tag counter (counts this tag's occurrences in DOM order)
+        tagCounters[tag] = (tagCounters[tag] || 0) + 1;
+        const tagIndex = tagCounters[tag];
+
         let type = undefined;
         let placeholder = undefined;
         let name = el.getAttribute('name') || undefined;
         let id = el.getAttribute('id') || undefined;
         let label = undefined;
+        let buttonText = undefined;
 
         if (el instanceof HTMLInputElement) {
           type = el.type;
@@ -249,23 +257,31 @@ export class PlaywrightService {
           }
         } else if (el instanceof HTMLButtonElement) {
           type = el.type || 'submit';
-          label = el.innerText?.trim() || el.getAttribute('aria-label') || undefined;
+          buttonText = el.innerText?.trim() || el.textContent?.trim() || undefined;
+          label = buttonText || el.getAttribute('aria-label') || undefined;
         }
 
-        // Generate clean CSS selector
+        // Generate a robust CSS selector — priority order:
+        //   id > name > placeholder > button text (:has-text) > accurate nth-of-type
         let selector = '';
         if (id) {
-          selector = `#${id}`;
+          // CSS-escape the id so special chars (dots, colons, spaces) don't break the selector
+          const safeId = id.replace(/([!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+          selector = '#' + safeId;
         } else if (name) {
-          selector = `${tag}[name="${name}"]`;
+          selector = tag + '[name="' + name.replace(/["\\]/g, '\\$&') + '"]';
         } else if (placeholder) {
-          selector = `${tag}[placeholder="${placeholder}"]`;
+          selector = tag + '[placeholder="' + placeholder.replace(/["\\]/g, '\\$&') + '"]';
+        } else if (tag === 'button' && buttonText) {
+          // Playwright :has-text() works across reloads without positional fragility
+          selector = 'button:has-text("' + buttonText.replace(/["\\]/g, '\\$&') + '")';
         } else {
-          selector = `${tag}:nth-of-type(${counter})`;
+          // Accurate nth-of-type: tagIndex counts only this tag, not all form controls
+          selector = tag + ':nth-of-type(' + tagIndex + ')';
         }
 
         items.push({
-          refId: `el-${counter++}`,
+          refId: `el-${refCounter++}`,
           tag,
           type,
           placeholder,
@@ -322,6 +338,18 @@ export class PlaywrightService {
         let lastStatus = 200;
 
         for (let i = 1; i <= iterations; i++) {
+          // Always reload the target URL before each probe so the form is in a clean state
+          // (previous submission may have redirected or changed page DOM)
+          await session.page.goto(session.targetUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+          });
+          try {
+            await session.page.waitForLoadState('networkidle', { timeout: 5000 });
+          } catch {
+            // Page is ready enough — continue
+          }
+
           await this.fillAndSubmit(
             session.page,
             config.usernameSelector,
@@ -331,11 +359,8 @@ export class PlaywrightService {
             `TestPass#${i}`
           );
 
-          if (config.requestDelayMs) {
-            await session.page.waitForTimeout(config.requestDelayMs);
-          } else {
-            await session.page.waitForTimeout(300);
-          }
+          const delay = config.requestDelayMs ?? 300;
+          await session.page.waitForTimeout(delay);
 
           // Check network logs for HTTP 429
           const recentLogs = session.networkLogs.slice(0, 3);
@@ -407,10 +432,27 @@ export class PlaywrightService {
           testPass = 'B'.repeat(128);
           break;
         case 'valid_login':
-          // Authorized user provided explicit credentials
+          // Authorized user provided explicit credentials; optionally generate a random password via Playwright
           testUser = config.usernameValue || '';
-          testPass = config.passwordValue || '';
+          if (config.useRandomPassword) {
+            testPass = this.generateRandomPassword();
+          } else {
+            testPass = config.passwordValue || '';
+          }
           break;
+      }
+
+      // Always navigate back to the target URL before filling — real-world pages
+      // often redirect after submission (e.g. /login?error=...) which leaves the
+      // DOM in a dirty state even when the URL looks the same.
+      await session.page.goto(session.targetUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000,
+      });
+      try {
+        await session.page.waitForLoadState('networkidle', { timeout: 5000 });
+      } catch {
+        // Page is ready enough — continue
       }
 
       await this.fillAndSubmit(
@@ -530,6 +572,33 @@ export class PlaywrightService {
     }
   }
 
+  // Generate a cryptographically strong random password on the server side
+  private generateRandomPassword(): string {
+    const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const lower = 'abcdefghijklmnopqrstuvwxyz';
+    const digits = '0123456789';
+    const symbols = '!@#$%^&*()-_=+[]{}|;:,.<>?';
+    const all = upper + lower + digits + symbols;
+    const { randomBytes } = require('crypto');
+    const buf: Buffer = randomBytes(16);
+    // Guarantee at least one character from each class
+    const pick = (charset: string, byte: number) => charset[byte % charset.length];
+    const required = [
+      pick(upper, buf[0]),
+      pick(lower, buf[1]),
+      pick(digits, buf[2]),
+      pick(symbols, buf[3]),
+    ];
+    const rest = Array.from(buf.slice(4), (b: number) => pick(all, b));
+    const combined = [...required, ...rest];
+    // Fisher-Yates shuffle using the random bytes
+    for (let i = combined.length - 1; i > 0; i--) {
+      const j = buf[i % buf.length] % (i + 1);
+      [combined[i], combined[j]] = [combined[j], combined[i]];
+    }
+    return combined.join('');
+  }
+
   // Safe element fill and submit helper
   private async fillAndSubmit(
     page: Page,
@@ -540,16 +609,25 @@ export class PlaywrightService {
     pass: string
   ) {
     if (userSel) {
-      await page.waitForSelector(userSel, { timeout: 4000 });
-      await page.fill(userSel, username);
+      const loc = page.locator(userSel).first();
+      await loc.waitFor({ state: 'visible', timeout: 15000 });
+      await loc.fill(username);
     }
     if (passSel) {
-      await page.waitForSelector(passSel, { timeout: 4000 });
-      await page.fill(passSel, pass);
+      const loc = page.locator(passSel).first();
+      await loc.waitFor({ state: 'visible', timeout: 15000 });
+      await loc.fill(pass);
     }
     if (submitSel) {
-      await page.waitForSelector(submitSel, { timeout: 4000 });
-      await page.click(submitSel);
+      const loc = page.locator(submitSel).first();
+      await loc.waitFor({ state: 'visible', timeout: 15000 });
+      await loc.click();
+      // Wait for the network request to complete before the caller checks logs
+      try {
+        await page.waitForLoadState('networkidle', { timeout: 5000 });
+      } catch {
+        // Form submitted — page may still be processing
+      }
     }
   }
 

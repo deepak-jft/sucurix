@@ -238,6 +238,7 @@ app.post('/api/sessions/:id/test', async (req: Request, res: Response) => {
     submitSelector,
     usernameValue,
     passwordValue,
+    useRandomPassword,
     requestDelayMs,
     rateLimitIterations,
   } = req.body;
@@ -256,6 +257,7 @@ app.post('/api/sessions/:id/test', async (req: Request, res: Response) => {
       submitSelector,
       usernameValue,
       passwordValue,
+      useRandomPassword,
       requestDelayMs,
       rateLimitIterations,
     };

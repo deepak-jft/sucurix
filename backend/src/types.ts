@@ -54,6 +54,7 @@ export interface TestScenarioConfig {
   submitSelector: string;
   usernameValue?: string;
   passwordValue?: string;
+  useRandomPassword?: boolean;
   requestDelayMs?: number;
   rateLimitIterations?: number;
 }
